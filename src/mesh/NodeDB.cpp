@@ -1,4 +1,3 @@
-#include "../userPrefs.h"
 #include "configuration.h"
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "GPS.h"
@@ -14,6 +13,7 @@
 #include "PowerFSM.h"
 #include "RTC.h"
 #include "Router.h"
+#include "SPILock.h"
 #include "SafeFile.h"
 #include "TypeConversions.h"
 #include "error.h"
@@ -61,6 +61,88 @@ meshtastic_LocalConfig config;
 meshtastic_DeviceUIConfig uiconfig{.screen_brightness = 153, .screen_timeout = 30};
 meshtastic_LocalModuleConfig moduleConfig;
 meshtastic_ChannelFile channelFile;
+
+#ifdef USERPREFS_USE_ADMIN_KEY_0
+static unsigned char userprefs_admin_key_0[] = USERPREFS_USE_ADMIN_KEY_0;
+#endif
+#ifdef USERPREFS_USE_ADMIN_KEY_1
+static unsigned char userprefs_admin_key_1[] = USERPREFS_USE_ADMIN_KEY_1;
+#endif
+#ifdef USERPREFS_USE_ADMIN_KEY_2
+static unsigned char userprefs_admin_key_2[] = USERPREFS_USE_ADMIN_KEY_2;
+#endif
+
+#ifdef HELTEC_MESH_NODE_T114
+
+uint32_t read8(uint8_t bits, uint8_t dummy, uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_t rst)
+{
+    uint32_t ret = 0;
+    uint8_t SDAPIN = mosi;
+    pinMode(SDAPIN, INPUT_PULLUP);
+    digitalWrite(dc, HIGH);
+    for (int i = 0; i < dummy; i++) { // any dummy clocks
+        digitalWrite(sck, HIGH);
+        delay(1);
+        digitalWrite(sck, LOW);
+        delay(1);
+    }
+    for (int i = 0; i < bits; i++) { // read results
+        ret <<= 1;
+        delay(1);
+        if (digitalRead(SDAPIN))
+            ret |= 1;
+        ;
+        digitalWrite(sck, HIGH);
+        delay(1);
+        digitalWrite(sck, LOW);
+    }
+    return ret;
+}
+
+void write9(uint8_t val, uint8_t dc_val, uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_t rst)
+{
+    pinMode(mosi, OUTPUT);
+    digitalWrite(dc, dc_val);
+    for (int i = 0; i < 8; i++) { // send command
+        digitalWrite(mosi, (val & 0x80) != 0);
+        delay(1);
+        digitalWrite(sck, HIGH);
+        delay(1);
+        digitalWrite(sck, LOW);
+        val <<= 1;
+    }
+}
+
+uint32_t readwrite8(uint8_t cmd, uint8_t bits, uint8_t dummy, uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_t rst)
+{
+    digitalWrite(cs, LOW);
+    write9(cmd, 0, cs, sck, mosi, dc, rst);
+    uint32_t ret = read8(bits, dummy, cs, sck, mosi, dc, rst);
+    digitalWrite(cs, HIGH);
+    return ret;
+}
+
+uint32_t get_st7789_id(uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_t rst)
+{
+    pinMode(cs, OUTPUT);
+    digitalWrite(cs, HIGH);
+    pinMode(cs, OUTPUT);
+    pinMode(sck, OUTPUT);
+    pinMode(mosi, OUTPUT);
+    pinMode(dc, OUTPUT);
+    pinMode(rst, OUTPUT);
+    digitalWrite(rst, LOW); // Hardware Reset
+    delay(10);
+    digitalWrite(rst, HIGH);
+    delay(10);
+
+    uint32_t ID = 0;
+    ID = readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst);
+    ID = readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst); // ST7789 needs twice
+    return ID;
+}
+
+#endif
 
 bool meshtastic_DeviceState_callback(pb_istream_t *istream, pb_ostream_t *ostream, const pb_field_iter_t *field)
 {
@@ -115,7 +197,7 @@ NodeDB::NodeDB()
     uint32_t channelFileCRC = crc32Buffer(&channelFile, sizeof(channelFile));
 
     int saveWhat = 0;
-    bool hasUniqueId = false;
+    // bool hasUniqueId = false;
     // Get device unique id
 #if defined(ARCH_ESP32) && defined(ESP_EFUSE_OPTIONAL_UNIQUE_ID)
     uint32_t unique_id[4];
@@ -342,12 +424,15 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
 {
     LOG_INFO("Perform factory reset!");
     // first, remove the "/prefs" (this removes most prefs)
-    rmDir("/prefs");
+    spiLock->lock();
+    rmDir("/prefs"); // this uses spilock internally...
+
 #ifdef FSCom
     if (FSCom.exists("/static/rangetest.csv") && !FSCom.remove("/static/rangetest.csv")) {
         LOG_ERROR("Could not remove rangetest.csv file");
     }
 #endif
+    spiLock->unlock();
     // second, install default state (this will deal with the duplicate mac address issue)
     installDefaultDeviceState();
     installDefaultConfig(!eraseBleBonds); // Also preserve the private key if we're not erasing BLE bonds
@@ -414,32 +499,37 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #else
     config.lora.ignore_mqtt = false;
 #endif
-#ifdef USERPREFS_USE_ADMIN_KEY
     // Initialize admin_key_count to zero
     byte numAdminKeys = 0;
 
+#ifdef USERPREFS_USE_ADMIN_KEY_0
     // Check if USERPREFS_ADMIN_KEY_0 is non-empty
-    if (sizeof(USERPREFS_ADMIN_KEY_0) > 0) {
-        memcpy(config.security.admin_key[numAdminKeys].bytes, USERPREFS_ADMIN_KEY_0, 32);
-        config.security.admin_key[numAdminKeys].size = 32;
+    if (sizeof(userprefs_admin_key_0) > 0) {
+        memcpy(config.security.admin_key[0].bytes, userprefs_admin_key_0, 32);
+        config.security.admin_key[0].size = 32;
         numAdminKeys++;
     }
-
-    // Check if USERPREFS_ADMIN_KEY_1 is non-empty
-    if (sizeof(USERPREFS_ADMIN_KEY_1) > 0) {
-        memcpy(config.security.admin_key[numAdminKeys].bytes, USERPREFS_ADMIN_KEY_1, 32);
-        config.security.admin_key[numAdminKeys].size = 32;
-        numAdminKeys++;
-    }
-
-    // Check if USERPREFS_ADMIN_KEY_2 is non-empty
-    if (sizeof(USERPREFS_ADMIN_KEY_2) > 0) {
-        memcpy(config.security.admin_key[config.security.admin_key_count].bytes, USERPREFS_ADMIN_KEY_2, 32);
-        config.security.admin_key[config.security.admin_key_count].size = 32;
-        numAdminKeys++;
-    }
-    config.security.admin_key_count = numAdminKeys;
 #endif
+
+#ifdef USERPREFS_USE_ADMIN_KEY_1
+    // Check if USERPREFS_ADMIN_KEY_1 is non-empty
+    if (sizeof(userprefs_admin_key_1) > 0) {
+        memcpy(config.security.admin_key[1].bytes, userprefs_admin_key_1, 32);
+        config.security.admin_key[1].size = 32;
+        numAdminKeys++;
+    }
+#endif
+
+#ifdef USERPREFS_USE_ADMIN_KEY_2
+    // Check if USERPREFS_ADMIN_KEY_2 is non-empty
+    if (sizeof(userprefs_admin_key_2) > 0) {
+        memcpy(config.security.admin_key[2].bytes, userprefs_admin_key_2, 32);
+        config.security.admin_key[2].size = 32;
+        numAdminKeys++;
+    }
+#endif
+    config.security.admin_key_count = numAdminKeys;
+
     if (shouldPreserveKey) {
         config.security.private_key.size = 32;
         memcpy(config.security.private_key.bytes, private_key_temp, config.security.private_key.size);
@@ -458,7 +548,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
 #if defined(USERPREFS_CONFIG_GPS_MODE)
     config.position.gps_mode = USERPREFS_CONFIG_GPS_MODE;
-#elif !HAS_GPS || defined(T_DECK) || defined(TLORA_T3S3_EPAPER)
+#elif !HAS_GPS || GPS_DEFAULT_NOT_PRESENT
     config.position.gps_mode = meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT;
 #elif !defined(GPS_RX_PIN)
     if (config.position.rx_gpio == 0)
@@ -483,6 +573,12 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #if defined(ST7735_CS) || defined(USE_EINK) || defined(ILI9341_DRIVER) || defined(ILI9342_DRIVER) || defined(ST7789_CS) ||       \
     defined(HX8357_CS) || defined(USE_ST7789)
     bool hasScreen = true;
+#ifdef HELTEC_MESH_NODE_T114
+    uint32_t st7789_id = get_st7789_id(ST7789_NSS, ST7789_SCK, ST7789_SDA, ST7789_RS, ST7789_RESET);
+    if (st7789_id == 0xFFFFFF) {
+        hasScreen = false;
+    }
+#endif
 #elif ARCH_PORTDUINO
     bool hasScreen = false;
     if (settingsMap[displayPanel])
@@ -511,7 +607,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #ifdef RAK4630
     config.display.wake_on_tap_or_motion = true;
 #endif
-#ifdef T_WATCH_S3
+#if defined(T_WATCH_S3) || defined(SENSECAP_INDICATOR)
     config.display.screen_on_secs = 30;
     config.display.wake_on_tap_or_motion = true;
 #endif
@@ -768,12 +864,12 @@ void NodeDB::installDefaultDeviceState()
 #ifdef USERPREFS_CONFIG_OWNER_LONG_NAME
     snprintf(owner.long_name, sizeof(owner.long_name), USERPREFS_CONFIG_OWNER_LONG_NAME);
 #else
-    snprintf(owner.long_name, sizeof(owner.long_name), "Meshtastic %02x%02x", ourMacAddr[4], ourMacAddr[5]);
+    snprintf(owner.long_name, sizeof(owner.long_name), "Meshtastic %04x", getNodeNum() & 0x0ffff);
 #endif
 #ifdef USERPREFS_CONFIG_OWNER_SHORT_NAME
     snprintf(owner.short_name, sizeof(owner.short_name), USERPREFS_CONFIG_OWNER_SHORT_NAME);
 #else
-    snprintf(owner.short_name, sizeof(owner.short_name), "%02x%02x", ourMacAddr[4], ourMacAddr[5]);
+    snprintf(owner.short_name, sizeof(owner.short_name), "%04x", getNodeNum() & 0x0ffff);
 #endif
     snprintf(owner.id, sizeof(owner.id), "!%08x", getNodeNum()); // Default node ID now based on nodenum
     memcpy(owner.macaddr, ourMacAddr, sizeof(owner.macaddr));
@@ -821,6 +917,7 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
 {
     LoadFileResult state = LoadFileResult::OTHER_FAILURE;
 #ifdef FSCom
+    concurrency::LockGuard g(spiLock);
 
     auto f = FSCom.open(filename, FILE_O_READ);
 
@@ -854,8 +951,10 @@ void NodeDB::loadFromDisk()
     // disk we will still factoryReset to restore things.
 
 #ifdef ARCH_ESP32
+    spiLock->lock();
     if (FSCom.exists("/static/static"))
         rmDir("/static/static"); // Remove bad static web files bundle from initial 2.5.13 release
+    spiLock->unlock();
 #endif
 
     // static DeviceState scratch; We no longer read into a tempbuf because this structure is 15KB of valuable RAM
@@ -895,6 +994,57 @@ void NodeDB::loadFromDisk()
         } else {
             LOG_INFO("Loaded saved config version %d", config.version);
         }
+    }
+
+    // Make sure we load hard coded admin keys even when the configuration file has none.
+    // Initialize admin_key_count to zero
+    byte numAdminKeys = 0;
+#if defined(USERPREFS_USE_ADMIN_KEY_0) || defined(USERPREFS_USE_ADMIN_KEY_1) || defined(USERPREFS_USE_ADMIN_KEY_2)
+    uint16_t sum = 0;
+#endif
+#ifdef USERPREFS_USE_ADMIN_KEY_0
+
+    for (uint8_t b = 0; b < 32; b++) {
+        sum += config.security.admin_key[0].bytes[b];
+    }
+    if (sum == 0) {
+        numAdminKeys += 1;
+        LOG_INFO("Admin 0 key zero. Loading hard coded key from user preferences.");
+        memcpy(config.security.admin_key[0].bytes, userprefs_admin_key_0, 32);
+        config.security.admin_key[0].size = 32;
+    }
+#endif
+
+#ifdef USERPREFS_USE_ADMIN_KEY_1
+    sum = 0;
+    for (uint8_t b = 0; b < 32; b++) {
+        sum += config.security.admin_key[1].bytes[b];
+    }
+    if (sum == 0) {
+        numAdminKeys += 1;
+        LOG_INFO("Admin 1 key zero. Loading hard coded key from user preferences.");
+        memcpy(config.security.admin_key[1].bytes, userprefs_admin_key_1, 32);
+        config.security.admin_key[1].size = 32;
+    }
+#endif
+
+#ifdef USERPREFS_USE_ADMIN_KEY_2
+    sum = 0;
+    for (uint8_t b = 0; b < 32; b++) {
+        sum += config.security.admin_key[2].bytes[b];
+    }
+    if (sum == 0) {
+        numAdminKeys += 1;
+        LOG_INFO("Admin 2 key zero. Loading hard coded key from user preferences.");
+        memcpy(config.security.admin_key[2].bytes, userprefs_admin_key_2, 32);
+        config.security.admin_key[2].size = 32;
+    }
+#endif
+
+    if (numAdminKeys > 0) {
+        LOG_INFO("Saving %d hard coded admin keys.", numAdminKeys);
+        config.security.admin_key_count = numAdminKeys;
+        saveToDisk(SEGMENT_CONFIG);
     }
 
     state = loadProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, sizeof(meshtastic_LocalModuleConfig),
@@ -954,9 +1104,6 @@ void NodeDB::loadFromDisk()
 bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t *fields, const void *dest_struct,
                        bool fullAtomic)
 {
-#ifdef ARCH_ESP32
-    concurrency::LockGuard g(spiLock);
-#endif
     bool okay = false;
 #ifdef FSCom
     auto f = SafeFile(filename, fullAtomic);
@@ -984,7 +1131,9 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_
 bool NodeDB::saveChannelsToDisk()
 {
 #ifdef FSCom
+    spiLock->lock();
     FSCom.mkdir("/prefs");
+    spiLock->unlock();
 #endif
     return saveProto(channelFileName, meshtastic_ChannelFile_size, &meshtastic_ChannelFile_msg, &channelFile);
 }
@@ -992,7 +1141,9 @@ bool NodeDB::saveChannelsToDisk()
 bool NodeDB::saveDeviceStateToDisk()
 {
 #ifdef FSCom
+    spiLock->lock();
     FSCom.mkdir("/prefs");
+    spiLock->unlock();
 #endif
     // Note: if MAX_NUM_NODES=100 and meshtastic_NodeInfoLite_size=166, so will be approximately 17KB
     // Because so huge we _must_ not use fullAtomic, because the filesystem is probably too small to hold two copies of this
@@ -1005,7 +1156,9 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
     bool success = true;
 
 #ifdef FSCom
+    spiLock->lock();
     FSCom.mkdir("/prefs");
+    spiLock->unlock();
 #endif
     if (saveWhat & SEGMENT_CONFIG) {
         config.has_device = true;
@@ -1056,7 +1209,9 @@ bool NodeDB::saveToDisk(int saveWhat)
     if (!success) {
         LOG_ERROR("Failed to save to disk, retrying");
 #ifdef ARCH_NRF52 // @geeksville is not ready yet to say we should do this on other platforms.  See bug #4184 discussion
+        spiLock->lock();
         FSCom.format();
+        spiLock->unlock();
 
 #endif
         success = saveToDiskNoRetry(saveWhat);
@@ -1195,7 +1350,6 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         return false;
     }
 
-    LOG_DEBUG("old user %s/%s, channel=%d", info->user.long_name, info->user.short_name, info->channel);
 #if !(MESHTASTIC_EXCLUDE_PKI)
     if (p.public_key.size > 0) {
         printBytes("Incoming Pubkey: ", p.public_key.bytes, 32);
@@ -1219,7 +1373,8 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
     }
     if (nodeId != getNodeNum())
         info->channel = channelIndex; // Set channel we need to use to reach this node (but don't set our own channel)
-    LOG_DEBUG("Update changed=%d user %s/%s, channel=%d", changed, info->user.long_name, info->user.short_name, info->channel);
+    LOG_DEBUG("Update changed=%d user %s/%s, id=0x%08x, channel=%d", changed, info->user.long_name, info->user.short_name, nodeId,
+              info->channel);
     info->has_user = true;
 
     if (changed) {
@@ -1227,10 +1382,14 @@ bool NodeDB::updateUser(uint32_t nodeId, meshtastic_User &p, uint8_t channelInde
         powerFSM.trigger(EVENT_NODEDB_UPDATED);
         notifyObservers(true); // Force an update whether or not our node counts have changed
 
-        // We just changed something about the user, store our DB
-        Throttle::execute(
-            &lastNodeDbSave, ONE_MINUTE_MS, []() { nodeDB->saveToDisk(SEGMENT_DEVICESTATE); },
-            []() { LOG_DEBUG("Defer NodeDB saveToDisk for now"); }); // since we saved less than a minute ago
+        // We just changed something about a User,
+        // store our DB unless we just did so less than a minute ago
+        if (!Throttle::isWithinTimespanMs(lastNodeDbSave, ONE_MINUTE_MS)) {
+            saveToDisk(SEGMENT_DEVICESTATE);
+            lastNodeDbSave = millis();
+        } else {
+            LOG_DEBUG("Defer NodeDB saveToDisk for now");
+        }
     }
 
     return changed;
@@ -1297,7 +1456,7 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
 
     if (!lite) {
         if (isFull()) {
-            LOG_INFO("Node database full with %i nodes and %i bytes free. Erasing oldest entry", numMeshNodes,
+            LOG_INFO("Node database full with %i nodes and %u bytes free. Erasing oldest entry", numMeshNodes,
                      memGet.getFreeHeap());
             // look for oldest node and erase it
             uint32_t oldest = UINT32_MAX;
@@ -1336,10 +1495,17 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
         // everything is missing except the nodenum
         memset(lite, 0, sizeof(*lite));
         lite->num = n;
-        LOG_INFO("Adding node to database with %i nodes and %i bytes free!", numMeshNodes, memGet.getFreeHeap());
+        LOG_INFO("Adding node to database with %i nodes and %u bytes free!", numMeshNodes, memGet.getFreeHeap());
     }
 
     return lite;
+}
+
+/// Sometimes we will have Position objects that only have a time, so check for
+/// valid lat/lon
+bool NodeDB::hasValidPosition(const meshtastic_NodeInfoLite *n)
+{
+    return n->has_position && (n->position.latitude_i != 0 || n->position.longitude_i != 0);
 }
 
 /// Record an error that should be reported via analytics
