@@ -23,6 +23,10 @@ SPIClass SPI1(HSPI);
 #define SDHandler SPI
 #endif
 
+#ifndef SD_SPI_FREQUENCY
+#define SD_SPI_FREQUENCY 4000000U
+#endif
+
 #endif // HAS_SDCARD
 
 #if defined(ARCH_STM32WL)
@@ -48,24 +52,6 @@ void OSFS::writeNBytes(uint16_t address, unsigned int num, const byte *input)
     }
 }
 #endif
-
-bool lfs_assert_failed =
-    false; // Note: we use this global on all platforms, though it can only be set true on nrf52 (in our modified lfs_util.h)
-
-extern "C" void lfs_assert(const char *reason)
-{
-    LOG_ERROR("LFS assert: %s", reason);
-    lfs_assert_failed = true;
-
-#ifndef ARCH_PORTDUINO
-#ifdef FSCom
-    // CORRUPTED FILESYSTEM. This causes bootloop so
-    // might as well try formatting now.
-    LOG_ERROR("Trying FSCom.format()");
-    FSCom.format();
-#endif
-#endif
-}
 
 /**
  * @brief Copies a file from one location to another.
@@ -203,7 +189,7 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels)
                 file.close();
             }
         } else {
-            meshtastic_FileInfo fileInfo = {"", file.size()};
+            meshtastic_FileInfo fileInfo = {"", static_cast<uint32_t>(file.size())};
 #ifdef ARCH_ESP32
             strcpy(fileInfo.file_name, file.path());
 #else
@@ -348,10 +334,16 @@ void rmDir(const char *dirname)
 #endif
 }
 
+/**
+ * Some platforms (nrf52) might need to do an extra step before FSBegin().
+ */
+__attribute__((weak, noinline)) void preFSBegin() {}
+
 void fsInit()
 {
 #ifdef FSCom
-    spiLock->lock();
+    concurrency::LockGuard g(spiLock);
+    preFSBegin();
     if (!FSBegin()) {
         LOG_ERROR("Filesystem mount failed");
         // assert(0); This auto-formats the partition, so no need to fail here.
@@ -362,7 +354,6 @@ void fsInit()
     LOG_DEBUG("Filesystem files:");
 #endif
     listDir("/", 10);
-    spiLock->unlock();
 #endif
 }
 
@@ -374,8 +365,7 @@ void setupSDCard()
 #ifdef HAS_SDCARD
     concurrency::LockGuard g(spiLock);
     SDHandler.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
-
-    if (!SD.begin(SDCARD_CS, SDHandler)) {
+    if (!SD.begin(SDCARD_CS, SDHandler, SD_SPI_FREQUENCY)) {
         LOG_DEBUG("No SD_MMC card detected");
         return;
     }
